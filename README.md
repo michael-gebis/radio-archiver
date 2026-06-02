@@ -7,7 +7,10 @@ best-effort schedule tag, all stored in one JSON sidecar per hour.
 
 The station is **not hardcoded** — the stream URL, schedule URL, and related
 settings live in `config.json` (see [Configuration](#configuration)). The
-bundled `config.json` targets UCLA Radio as a working example.
+repo ships `config.example.json` with generic placeholder URLs; copy it to
+`config.json` and edit it to point at your station. The author runs this
+against [UCLA Radio](https://uclaradio.com/), but any station that publishes
+an Icecast-style MP3 stream should work.
 
 | Script | Job |
 |---|---|
@@ -26,9 +29,11 @@ bundled `config.json` targets UCLA Radio as a working example.
   cross-platform; per-OS specifics are in [§10](#10-platform-notes).
 - **Python 3.11–3.13** (developed on 3.13).
 - **ffmpeg + ffprobe** — used by `archive.py` for recording, and by
-  `transcribe.py`/`quality.py` for the silence + decode-error checks.
-  (Whisper itself decodes audio via the bundled PyAV/`av` library, so if ffmpeg
-  is missing transcription still works — quality just records a `tool_error`.)
+  `transcribe.py`/`quality.py` for the silence check and the full
+  null-muxer decode pass that catches mid-stream frame errors.
+  (Whisper itself decodes audio via the bundled PyAV/`av` library, so if
+  ffmpeg is missing transcription still works — quality just records a
+  `tool_error`.)
 - **~250 MB disk** for the Whisper model (downloaded automatically on first run).
 - **No GPU required.** Transcription runs on CPU. An NVIDIA GPU can optionally
   accelerate it; Intel/AMD integrated GPUs are *not* usable by faster-whisper.
@@ -77,7 +82,7 @@ PyTorch or TensorFlow required.
 > Examples below use the activated `python`; the service templates in
 > [§10](#10-platform-notes) use the full path.
 
-**Versions this was built/tested against:**
+**Versions this was built/tested against** (as of 2026-06):
 
 ```
 faster-whisper 1.2.1
@@ -109,11 +114,13 @@ and edit it:
 cp config.example.json config.json   # then edit the URLs
 ```
 
+This is exactly what `config.example.json` contains:
+
 ```json
 {
-  "label": "UCLA Radio",
-  "stream":   { "url": "https://live.uclaradio.com/listen/ucla_radio/radio.mp3", "bitrate_kbps": 192 },
-  "schedule": { "url": "https://uclaradio.com/home/shows/", "source_type": "r34ics" },
+  "label": "My Radio Station",
+  "stream":   { "url": "https://stream.example.com/listen/my_station/radio.mp3", "bitrate_kbps": 192 },
+  "schedule": { "url": "https://example.com/shows/", "source_type": "r34ics" },
   "paths":    { "archive_dir": "archive", "schedule_dir": "schedule" }
 }
 ```
@@ -248,7 +255,7 @@ full **provenance** block so a future reader can decide whether re-transcribing
     "ok": false
   },
   "schedule_hint": {
-    "source": "https://uclaradio.com/home/shows/",
+    "source": "https://example.com/shows/",
     "note": "Best-effort match from the published weekly schedule; the actual broadcast may differ and is not guaranteed.",
     "snapshot_date": "2026-05-26",
     "snapshot_after_recording": true,
@@ -391,24 +398,25 @@ CTranslate2-backed, so it's fast on CPU, quantizes to int8, and needs neither
 PyTorch nor TensorFlow. Lightest path to a working CPU pipeline.
 
 **Why CPU + int8.**
-The dev machine has no NVIDIA GPU (Intel Arc integrated, which faster-whisper
-can't use). The workload is batch — one hour of audio per hour of wall-clock —
-so CPU is plenty: on the dev box it ran talk-heavy audio at ~10× realtime and
-music hours near-instantly (VAD discards them before transcription).
+The workload is batch — one hour of audio per hour of wall-clock — so CPU is
+plenty even without a discrete GPU (the dev box runs talk-heavy audio at
+~10× realtime and music hours near-instantly, since VAD discards them
+before transcription). faster-whisper can't use Intel Arc / AMD integrated
+GPUs, so on a machine without NVIDIA hardware CPU+int8 is the only path.
 *On a machine with an NVIDIA GPU,* set `device="cuda"` and
 `compute_type="float16"` in `transcribe.py` for a large speedup.
 
 **Why Silero VAD instead of a speech/music classifier.**
-The purpose-built option, **inaSpeechSegmenter** (true speech-vs-music labels),
-was *not* installed — it pulls in TensorFlow and the environment's install
-guardrail blocked it. Silero VAD (bundled, zero extra deps) solves the core
-problem: instrumental music and silence are dropped cleanly.
+The purpose-built option, **inaSpeechSegmenter** (true speech-vs-music
+labels), pulls in TensorFlow, which we wanted to avoid to keep the install
+lightweight. Silero VAD (bundled with faster-whisper, zero extra deps)
+solves the core problem: instrumental music and silence are dropped cleanly.
 - **Limitation:** VAD detects *voice activity*, not music specifically. Songs
   with prominent **sung vocals** can occasionally be sent to Whisper, producing
   messy lyric-ish lines. The VAD `threshold` is set conservatively (0.6) to
   reduce this. If clean speech/music separation matters, add inaSpeechSegmenter
-  (requires approving its install + a TensorFlow-compatible Python) and gate
-  Whisper on its "speech" regions.
+  (needs a TensorFlow-compatible Python) and gate Whisper on its "speech"
+  regions.
 
 **Model choice (`small.en`).**
 English-only is faster and more accurate on English speech than the
@@ -434,8 +442,11 @@ monitoring). Not implemented here.
 1. Install Python 3.11–3.13, ffmpeg, and [uv](https://docs.astral.sh/uv/).
 2. `uv venv` and activate it.
 3. `uv pip install faster-whisper` (or `uv pip install -r requirements.txt`).
-4. `cp config.example.json config.json` and set your `stream.url` / `schedule.url`
-   (required — the scripts won't import without `config.json`).
+4. Copy the example config and edit the URLs (required — the scripts won't
+   import without `config.json`):
+   - macOS / Linux: `cp config.example.json config.json`
+   - Windows (PowerShell): `Copy-Item config.example.json config.json`
+   Then set your `stream.url` / `schedule.url`.
 5. `python archive.py --test` — confirms ffmpeg works and records a 60s sample.
 6. `python transcribe.py <that-test-file>.mp3` — first run downloads the model;
    confirms transcription works.
@@ -477,8 +488,8 @@ from `config.json`), `SIZE_RATIO_WARN` (0.80), `SILENCE_THRESHOLD` (`-40dB`),
 The published schedule at the configured `schedule.url` is archived and parsed
 by `schedule_archive.py`, then used to tag transcripts (the `schedule_hint`
 field — see [§4](#4-output-format)). The default `r34ics` source adapter targets
-the ICS Calendar WordPress plugin; the bundled config points it at UCLA Radio's
-shows page.
+the ICS Calendar WordPress plugin; pick whatever URL your station publishes its
+schedule at and put it in `config.json`.
 
 > **Not authoritative.** Shows are sometimes changed without the schedule being
 > updated, and the page's format has changed many times. Treat every schedule
@@ -495,6 +506,12 @@ python schedule_archive.py --reparse-all # re-parse EVERY archived day (see belo
 python transcribe.py --retag            # refresh schedule_hint on existing
                                         #   transcripts (no re-transcription)
 ```
+
+> **`--force` is undo-safe.** Before refetching it rotates the existing
+> `YYYY-MM-DD.page.html` / `.calendar.html` / `.json` trio to `*.bak`. If
+> the fetch fails, the previous trio is restored from `.bak` — so a bad
+> re-fetch never destroys a good snapshot. On success the `.bak` files are
+> left behind for a one-deep manual undo.
 
 ### Versioned parsers (surviving format changes)
 
@@ -524,6 +541,10 @@ every day was archived and each parser still recognizes its own era. If no
 parser matches a file, that day's snapshot just records `parse_ok: false` with an
 error and keeps its raw HTML, waiting for a parser to be added.
 
+A parser whose `detect()` raises is logged at warning level by
+`select_parser()` and skipped, so a buggy detector for a new format is
+debuggable from the logs rather than silently masking other parsers.
+
 ### Running it daily
 
 `schedule_archive.py` archives one dated snapshot per run. Schedule it once a day
@@ -535,7 +556,7 @@ with the OS scheduler:
     "<project-dir>\.venv\Scripts\python.exe <project-dir>\schedule_archive.py" `
     /sc daily /st 04:00
   ```
-  (Replace `<project-dir>` with the absolute path to your checkout, e.g. `C:\Users\you\ucla_radio`.)
+  (Replace `<project-dir>` with the absolute path to your checkout, e.g. `C:\Users\you\radio-archiver`.)
 - **macOS/Linux (cron):** `0 4 * * * cd /path/to/proj && .venv/bin/python schedule_archive.py`
   — cron runs with a minimal `PATH`; if ffmpeg isn't found, prepend
   `FFMPEG=/usr/bin/ffmpeg FFPROBE=/usr/bin/ffprobe` or set `PATH` (see
@@ -591,20 +612,28 @@ path on macOS; don't set `device="cuda"`.
 **HuggingFace symlink warning** on first model download is **Windows-only**;
 Linux/macOS support symlinks and won't show it.
 
+**Graceful shutdown.** `archive.py` traps SIGINT and SIGTERM and asks ffmpeg
+to stop cleanly so the in-progress hour's MP3 is closed with a proper
+trailer. On POSIX this is plain SIGTERM; on Windows the recorder launches
+ffmpeg with `CREATE_NEW_PROCESS_GROUP` and sends `CTRL_BREAK_EVENT` for the
+same effect — so Ctrl+C on Windows now stops cleanly without truncating the
+in-progress segment. If ffmpeg ignores the graceful stop, the recorder falls
+back to `terminate()` after 10 s and `kill()` after another 5 s.
+
 **venv interpreter path:** `.venv\Scripts\python.exe` (Windows) vs
 `.venv/bin/python` (Linux/macOS) — used in the templates below.
 
 ### Running as services
 
 The recorder and the `--watch` transcriber are long-running; the schedule fetch
-is daily. Replace `/home/you/ucla_radio` (or `/Users/you/...`), the `User`, and
-the ffmpeg path to match your box.
+is daily. Replace `/home/you/radio-archiver` (or `/Users/you/...`), the `User`,
+and the ffmpeg path to match your box.
 
 **Linux — systemd** (drop in `/etc/systemd/system/`, or `~/.config/systemd/user/`
 and use `systemctl --user`):
 
 ```ini
-# ucla-archive.service — records the stream
+# radio-archive.service — records the stream
 [Unit]
 Description=Radio archiver
 After=network-online.target
@@ -612,9 +641,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=you
-WorkingDirectory=/home/you/ucla_radio
+WorkingDirectory=/home/you/radio-archiver
 Environment=FFMPEG=/usr/bin/ffmpeg FFPROBE=/usr/bin/ffprobe
-ExecStart=/home/you/ucla_radio/.venv/bin/python archive.py
+ExecStart=/home/you/radio-archiver/.venv/bin/python archive.py
 Restart=always
 RestartSec=5
 [Install]
@@ -622,16 +651,16 @@ WantedBy=multi-user.target
 ```
 
 ```ini
-# ucla-transcribe.service — transcribes each finished hour
+# radio-transcribe.service — transcribes each finished hour
 [Unit]
 Description=Radio transcriber (--watch)
 After=network-online.target
 [Service]
 Type=simple
 User=you
-WorkingDirectory=/home/you/ucla_radio
+WorkingDirectory=/home/you/radio-archiver
 Environment=FFMPEG=/usr/bin/ffmpeg FFPROBE=/usr/bin/ffprobe
-ExecStart=/home/you/ucla_radio/.venv/bin/python transcribe.py --watch
+ExecStart=/home/you/radio-archiver/.venv/bin/python transcribe.py --watch
 Restart=always
 RestartSec=10
 [Install]
@@ -639,16 +668,16 @@ WantedBy=multi-user.target
 ```
 
 ```ini
-# ucla-schedule.service + ucla-schedule.timer — daily schedule snapshot
-# --- ucla-schedule.service ---
+# radio-schedule.service + radio-schedule.timer — daily schedule snapshot
+# --- radio-schedule.service ---
 [Unit]
 Description=Radio schedule snapshot
 [Service]
 Type=oneshot
 User=you
-WorkingDirectory=/home/you/ucla_radio
-ExecStart=/home/you/ucla_radio/.venv/bin/python schedule_archive.py
-# --- ucla-schedule.timer ---
+WorkingDirectory=/home/you/radio-archiver
+ExecStart=/home/you/radio-archiver/.venv/bin/python schedule_archive.py
+# --- radio-schedule.timer ---
 [Unit]
 Description=Daily radio schedule snapshot
 [Timer]
@@ -659,9 +688,9 @@ WantedBy=timers.target
 ```
 
 ```bash
-sudo systemctl enable --now ucla-archive.service ucla-transcribe.service
-sudo systemctl enable --now ucla-schedule.timer
-journalctl -u ucla-transcribe -f          # follow logs
+sudo systemctl enable --now radio-archive.service radio-transcribe.service
+sudo systemctl enable --now radio-schedule.timer
+journalctl -u radio-transcribe -f         # follow logs
 ```
 
 **macOS — launchd** (LaunchAgents in `~/Library/LaunchAgents/`). One plist per
@@ -676,10 +705,10 @@ daily fetch swap `KeepAlive`/`RunAtLoad` for `StartCalendarInterval`:
   <key>Label</key><string>com.radio.transcribe</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/you/ucla_radio/.venv/bin/python</string>
+    <string>/Users/you/radio-archiver/.venv/bin/python</string>
     <string>transcribe.py</string><string>--watch</string>
   </array>
-  <key>WorkingDirectory</key><string>/Users/you/ucla_radio</string>
+  <key>WorkingDirectory</key><string>/Users/you/radio-archiver</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>FFMPEG</key><string>/opt/homebrew/bin/ffmpeg</string>
@@ -687,8 +716,8 @@ daily fetch swap `KeepAlive`/`RunAtLoad` for `StartCalendarInterval`:
   </dict>
   <key>KeepAlive</key><true/>
   <key>RunAtLoad</key><true/>
-  <key>StandardOutPath</key><string>/Users/you/ucla_radio/transcribe.out.log</string>
-  <key>StandardErrorPath</key><string>/Users/you/ucla_radio/transcribe.err.log</string>
+  <key>StandardOutPath</key><string>/Users/you/radio-archiver/transcribe.out.log</string>
+  <key>StandardErrorPath</key><string>/Users/you/radio-archiver/transcribe.err.log</string>
 </dict></plist>
 ```
 
@@ -696,7 +725,7 @@ daily fetch swap `KeepAlive`/`RunAtLoad` for `StartCalendarInterval`:
 <!-- daily schedule fetch: same shape, but instead of KeepAlive/RunAtLoad use -->
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/you/ucla_radio/.venv/bin/python</string>
+    <string>/Users/you/radio-archiver/.venv/bin/python</string>
     <string>schedule_archive.py</string>
   </array>
   <key>StartCalendarInterval</key>
@@ -757,3 +786,9 @@ candidate — so the merge is auditable after the fact.
 
 Schedule dirs (`--schedule-*`) merge in parallel with simpler rules: prefer
 `parse_ok`, then higher `event_count` per date.
+
+---
+
+## License
+
+MIT — see [`LICENSE`](LICENSE).
