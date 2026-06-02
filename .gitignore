@@ -1,0 +1,22 @@
+# Local config (copy of config.example.json with real URLs)
+config.json
+
+# Virtual environment
+.venv/
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Runtime artifacts
+archiver.log
+issues.log
+
+# Recorded audio + sidecars (kept out of git; archive on disk only)
+archive/
+schedule/
+
+# Local IDE / tool settings
+.claude/
+.vscode/
+.idea/

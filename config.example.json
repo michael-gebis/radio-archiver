@@ -1,0 +1,15 @@
+{
+  "label": "My Radio Station",
+  "stream": {
+    "url": "https://stream.example.com/listen/my_station/radio.mp3",
+    "bitrate_kbps": 192
+  },
+  "schedule": {
+    "url": "https://example.com/shows/",
+    "source_type": "r34ics"
+  },
+  "paths": {
+    "archive_dir": "archive",
+    "schedule_dir": "schedule"
+  }
+}
