@@ -320,7 +320,7 @@ def retag_all() -> None:
     If the matching .mp3 is missing we leave `schema_version` alone — never
     upgrade the stamp without being able to fill the fields.
     """
-    files = sorted(ARCHIVE_DIR.glob("*.json"))
+    files = sorted(ARCHIVE_DIR.rglob("*.json"))
     if not files:
         log.info("No transcript JSONs found in %s", ARCHIVE_DIR)
         return
@@ -370,7 +370,7 @@ def _completed_segments() -> list[Path]:
     would otherwise sweep up as a partial, while still letting an old
     short-segment from a long-stopped run through.
     """
-    mp3s = sorted(p for p in ARCHIVE_DIR.glob("*.mp3") if p.stat().st_size > 0)
+    mp3s = sorted(p for p in ARCHIVE_DIR.rglob("*.mp3") if p.stat().st_size > 0)
     if not mp3s:
         return []
     newest = mp3s[-1]

@@ -28,6 +28,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import date
 from pathlib import Path
 from types import FrameType
 
@@ -139,7 +140,7 @@ def _watcher(stop_event: threading.Event) -> None:
     done: set[Path] = set()
 
     while not stop_event.is_set():
-        files = sorted(ARCHIVE_DIR.glob("*.mp3"))
+        files = sorted(ARCHIVE_DIR.rglob("*.mp3"))
         complete = files[:-1] if len(files) > 1 else []   # last is still recording
         for f in complete:
             if f not in done:
@@ -149,7 +150,7 @@ def _watcher(stop_event: threading.Event) -> None:
         stop_event.wait(30)
 
     # On shutdown, process any completed files not yet handled.
-    files = sorted(ARCHIVE_DIR.glob("*.mp3"))
+    files = sorted(ARCHIVE_DIR.rglob("*.mp3"))
     for f in (files[:-1] if len(files) > 1 else []):
         if f not in done and not f.with_suffix(".json").exists():
             _transcribe_segment(f)
@@ -166,9 +167,32 @@ def _drain_stderr(proc: subprocess.Popen) -> None:
             log.warning("[ffmpeg] %s", line)
 
 
-def _build_cmd(segment_seconds: int) -> list[str]:
+def _ensure_month_dirs(months_ahead: int = 24) -> None:
+    """
+    Create archive/YYYY/MM/ for the current month and the next `months_ahead`
+    months. ffmpeg's segment muxer does not create intermediate directories,
+    so we have to prepare them up-front — otherwise the first segment after a
+    month rollover would fail to open. 24 months of buffer means the recorder
+    can run uninterrupted for two years without manual help; each restart
+    (e.g. on a stream-drop reconnect) re-extends the buffer.
+    """
     ARCHIVE_DIR.mkdir(exist_ok=True)
-    output_pattern = str(ARCHIVE_DIR / "%Y-%m-%d_%H-00.mp3")
+    today = date.today()
+    year, month = today.year, today.month
+    for _ in range(months_ahead + 1):
+        (ARCHIVE_DIR / f"{year:04d}" / f"{month:02d}").mkdir(parents=True, exist_ok=True)
+        month += 1
+        if month > 12:
+            month = 1
+            year += 1
+
+
+def _build_cmd(segment_seconds: int) -> list[str]:
+    _ensure_month_dirs()
+    # Files land in archive/YYYY/MM/YYYY-MM-DD_HH-00.mp3 so a multi-year
+    # archive stays browsable. ffmpeg substitutes %Y/%m/%d/%H from the wall
+    # clock at the moment each new segment opens.
+    output_pattern = str(ARCHIVE_DIR / "%Y" / "%m" / "%Y-%m-%d_%H-00.mp3")
     return [
         FFMPEG,
         "-hide_banner",

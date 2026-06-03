@@ -67,13 +67,31 @@ class Candidate:
     data: dict | None
 
 
+def _nested_hour_path(archive_dir: Path, hour: str, ext: str) -> Path:
+    """archive_dir/<YYYY>/<MM>/<hour><ext> — the canonical write location."""
+    dt = datetime.strptime(hour, transcribe.FILENAME_DT_FORMAT)
+    return archive_dir / f"{dt.year:04d}" / f"{dt.month:02d}" / f"{hour}{ext}"
+
+
+def _hour_path(archive_dir: Path, hour: str, ext: str) -> Path:
+    """
+    Resolve where a given hour's `.mp3` / `.json` / `.txt` already lives on a
+    side. New archives are nested under `<year>/<month>/`; legacy archives are
+    flat. Prefer the nested location if it exists, otherwise fall back to flat.
+    """
+    nested = _nested_hour_path(archive_dir, hour, ext)
+    if nested.exists():
+        return nested
+    return archive_dir / f"{hour}{ext}"
+
+
 def _load_candidate(side: Side, hour: str) -> Candidate | None:
     """Return a Candidate if the side has a non-empty .mp3 for `hour`, else None."""
-    mp3 = side.archive_dir / f"{hour}.mp3"
+    mp3 = _hour_path(side.archive_dir, hour, ".mp3")
     if not mp3.exists() or mp3.stat().st_size == 0:
         return None
-    json_path = side.archive_dir / f"{hour}.json"
-    txt_path = side.archive_dir / f"{hour}.txt"
+    json_path = _hour_path(side.archive_dir, hour, ".json")
+    txt_path = _hour_path(side.archive_dir, hour, ".txt")
     data: dict | None = None
     if json_path.exists():
         try:
@@ -159,12 +177,15 @@ def _decide(a: Candidate | None, b: Candidate | None, splice: bool) -> tuple[str
 # ---------------------------------------------------------------------------
 
 def _copy_trio(src: Candidate, out_dir: Path) -> None:
-    """Copy the chosen side's mp3 + json + txt to the output dir."""
-    shutil.copy2(src.mp3, out_dir / src.mp3.name)
+    """Copy the chosen side's mp3 + json + txt into the output dir, written
+    into the canonical YYYY/MM/ subdir."""
+    dest_mp3 = _nested_hour_path(out_dir, src.mp3.stem, ".mp3")
+    dest_mp3.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src.mp3, dest_mp3)
     if src.json_path.exists():
-        shutil.copy2(src.json_path, out_dir / src.json_path.name)
+        shutil.copy2(src.json_path, dest_mp3.with_suffix(".json"))
     if src.txt_path.exists():
-        shutil.copy2(src.txt_path, out_dir / src.txt_path.name)
+        shutil.copy2(src.txt_path, dest_mp3.with_suffix(".txt"))
 
 
 def _good_regions(c: Candidate) -> list[tuple[float, float]]:
@@ -337,10 +358,11 @@ def merge_archives(arch_a: Path, arch_b: Path, out: Path,
     side_a = Side("A", arch_a)
     side_b = Side("B", arch_b)
 
-    # Collect hour-keys; validate the filename pattern.
+    # Collect hour-keys; validate the filename pattern. rglob picks up both
+    # the new YYYY/MM/ layout and the legacy flat layout.
     hours: set[str] = set()
     for d in (arch_a, arch_b):
-        for f in d.glob("*.mp3"):
+        for f in d.rglob("*.mp3"):
             try:
                 datetime.strptime(f.stem, transcribe.FILENAME_DT_FORMAT)
                 hours.add(f.stem)
@@ -349,8 +371,8 @@ def merge_archives(arch_a: Path, arch_b: Path, out: Path,
     log.info("Audio: %d unique hour(s) to consider.", len(hours))
 
     # Clock-skew sanity warning.
-    a_hours = {f.stem for f in arch_a.glob("*.mp3")} & hours
-    b_hours = {f.stem for f in arch_b.glob("*.mp3")} & hours
+    a_hours = {f.stem for f in arch_a.rglob("*.mp3")} & hours
+    b_hours = {f.stem for f in arch_b.rglob("*.mp3")} & hours
     if a_hours and b_hours and not (a_hours & b_hours):
         log.warning(
             "No overlapping hour-keys between A (%d) and B (%d). Check NTP / clock skew.",
@@ -375,7 +397,8 @@ def merge_archives(arch_a: Path, arch_b: Path, out: Path,
             elif mode in ("b_only", "use_b"):
                 _copy_trio(cb, out)  # type: ignore[arg-type]
             elif mode == "spliced":
-                out_mp3 = out / f"{hour}.mp3"
+                out_mp3 = _nested_hour_path(out, hour, ".mp3")
+                out_mp3.parent.mkdir(parents=True, exist_ok=True)
                 chunks = _splice(ca, cb, out_mp3)  # type: ignore[arg-type]
                 entry["splice_chunks"] = chunks
                 # Regenerate the JSON/TXT for the new audio. transcribe_file

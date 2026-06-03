@@ -174,10 +174,19 @@ python archive.py --transcribe # single-process alternative: record AND transcri
                                #   the two-process setup above)
 ```
 
-Output lands in `archive/` as `YYYY-MM-DD_HH-00.mp3`. Recording logs go to
-`archiver.log`. Quality results are stored per hour in the transcript JSON (see
-[§4](#4-output-format)), not in a separate log — to (re-)compute quality for
-files lacking a transcript, just transcribe them.
+Output lands in `archive/YYYY/MM/YYYY-MM-DD_HH-00.mp3` — files are grouped
+by year and month so a multi-year archive stays browsable. The `.txt` and
+`.json` sidecars sit next to each `.mp3` in the same subdirectory.
+Recording logs go to `archiver.log`. Quality results are stored per hour in
+the transcript JSON (see [§4](#4-output-format)), not in a separate log — to
+(re-)compute quality for files lacking a transcript, just transcribe them.
+
+> **Legacy flat archives still work.** `transcribe.py`, `archive.py
+> --transcribe`, and `merge_archives.py` find files at any depth under the
+> archive directory (recursive glob), so an existing flat
+> `archive/YYYY-MM-DD_HH-00.mp3` layout is read transparently alongside the
+> new nested layout. Migrating old files into `archive/YYYY/MM/` is
+> optional and can be done with a one-shot shell script when convenient.
 
 ### Transcribing (standalone / backfill)
 
@@ -210,7 +219,8 @@ $env:WHISPER_MODEL="medium.en"; python transcribe.py --all   # PowerShell
 
 ## 4. Output format
 
-For each `archive/2026-05-24_12-00.mp3`, the transcriber writes two sidecars:
+For each `archive/2026/05/2026-05-24_12-00.mp3`, the transcriber writes two
+sidecars next to it (same subdirectory):
 
 **`2026-05-24_12-00.txt`** — human-readable:
 
@@ -330,7 +340,7 @@ A music-only hour writes valid sidecars with `segment_count: 0` and a
   │ ffmpeg segment muxer       │          │ poll archive/ for a COMPLETED hour     │
   │ -c copy, clock-aligned 1h, │  .mp3    │ lacking a .json sidecar                │
   │ auto-reconnect             │ ───────▶ │   │                                    │
-  │ archive/YYYY-MM-DD_HH-00   │  files   │   ├─ Silero VAD ─▶ speech ─▶ faster-   │
+  │ archive/YYYY/MM/...mp3     │  files   │   ├─ Silero VAD ─▶ speech ─▶ faster-   │
   └───────────────────────────┘          │   │  (drops music/silence)  whisper    │
      records only; never needs           │   ├─ quality.py: size/silence/errors    │
      restarting for transcription        │   └─ schedule_hint (schedule_archive)   │
