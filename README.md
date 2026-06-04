@@ -194,6 +194,38 @@ the transcript JSON (see [§4](#4-output-format)), not in a separate log — to
 > new nested layout. Migrating old files into `archive/YYYY/MM/` is
 > optional and can be done with a one-shot shell script when convenient.
 
+### Restart resilience: `.partN.mp3` siblings
+
+If `archive.py` (or the underlying ffmpeg) restarts mid-hour — script
+upgrade, reboot, stream drop, anything — the existing in-progress
+`YYYY-MM-DD_HH-00.mp3` is renamed to `YYYY-MM-DD_HH-00.partN.mp3` before
+the new ffmpeg invocation, so the new ffmpeg writes the canonical name
+fresh instead of truncating the old one. `N` is the smallest free integer,
+so multiple restarts within the same hour stack as `.part0`, `.part1`, …
+
+```
+archive/2026/06/
+  2026-06-04_01-00.part0.mp3   # first run, 01:31–01:45
+  2026-06-04_01-00.part1.mp3   # second run, 01:45–01:52
+  2026-06-04_01-00.mp3         # third run, 01:55–02:00 (the live one)
+  2026-06-04_02-00.mp3         # third run continued past the hour rollover
+```
+
+`transcribe.py` recognises the `.partN` suffix:
+- `schedule_hint` still gets the right hour (the suffix is stripped before
+  the timestamp is parsed).
+- `quality.analyze` is called with `partial=True`, which keeps the
+  measured size/silence/decode values but sets `size.ok = None` so the
+  short-file check doesn't flag it as a stream outage.
+- The `.txt` header shows `quality: PARTIAL HOUR (NN.N MB)` instead of
+  `SMALL SEGMENT`.
+
+Each `.partN.mp3` gets its own pair of sidecars, so a restart-y hour
+produces multiple transcripts — no automatic merge yet; if you want one
+combined file per hour, `ffmpeg -f concat -c copy` can splice them after
+the fact (this is what `merge_archives.py` does for redundant-recorder
+splices).
+
 ### Transcribing (standalone / backfill)
 
 ```bash

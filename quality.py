@@ -149,17 +149,24 @@ def _decode_scan(path: Path) -> tuple[str | None, int]:
 
 
 def analyze(path: str | Path, expected_seconds: int = EXPECTED_SEGMENT_SECONDS,
-            bitrate_kbps: int = DEFAULT_BITRATE_KBPS) -> dict:
+            bitrate_kbps: int = DEFAULT_BITRATE_KBPS, partial: bool = False) -> dict:
     """
     Run all quality checks on a completed segment. `bitrate_kbps` is the stream's
     expected bitrate (from config) used for the size estimate. Returns a
     structured dict and never raises: a missing ffmpeg/ffprobe is reported in
     `tool_error` with the ffmpeg-dependent checks left empty (the size check
     still works regardless).
+
+    When `partial=True` (used for archive.py's `.partN.mp3` rotation products,
+    which cover only a slice of the hour), the size check still reports its
+    measured / expected values but `size.ok` is set to None so a small partial
+    doesn't fail the overall `ok` — for a partial we can't fairly estimate
+    expected bytes.
     """
     path = Path(path)
     result = {
         "expected_seconds": expected_seconds,
+        "partial": partial,
         "size": _check_size(path, expected_seconds, bitrate_kbps),
         "silence_periods": [],
         "decode_errors": None,
@@ -172,6 +179,10 @@ def analyze(path: str | Path, expected_seconds: int = EXPECTED_SEGMENT_SECONDS,
             "silence_min_secs": SILENCE_MIN_SECS,
         },
     }
+    if partial:
+        # Inputs for size estimation aren't meaningful for an arbitrary
+        # subset of an hour. Keep the measured values, drop the pass/fail.
+        result["size"]["ok"] = None
     try:
         periods, sil_err = _check_silence(path)
         result["silence_periods"] = periods
@@ -184,8 +195,9 @@ def analyze(path: str | Path, expected_seconds: int = EXPECTED_SEGMENT_SECONDS,
         result["tool_error"] = f"ffmpeg/ffprobe not found: {e}"
     except Exception as e:
         result["tool_error"] = f"quality check failed: {e!r}"
+    size_ok = result["size"]["ok"]
     result["ok"] = (
-        result["size"]["ok"]
+        (size_ok is True or size_ok is None)
         and not result["silence_periods"]
         and not result["decode_errors"]
         and not result["tool_error"]
@@ -200,10 +212,14 @@ def summarize(quality: dict | None) -> str:
     if quality.get("tool_error"):
         return f"unavailable ({quality['tool_error']})"
     parts = []
-    size = quality.get("size", {})
-    if not size.get("ok", True):
-        parts.append(f"SMALL SEGMENT {size.get('actual_mb')}MB "
-                     f"({size.get('ratio', 0) * 100:.0f}%)")
+    if quality.get("partial"):
+        size = quality.get("size", {})
+        parts.append(f"PARTIAL HOUR ({size.get('actual_mb')}MB)")
+    else:
+        size = quality.get("size", {})
+        if size.get("ok") is False:
+            parts.append(f"SMALL SEGMENT {size.get('actual_mb')}MB "
+                         f"({size.get('ratio', 0) * 100:.0f}%)")
     silence = quality.get("silence_periods") or []
     if silence:
         total = sum(p["duration"] for p in silence if p.get("duration"))

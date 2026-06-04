@@ -167,6 +167,45 @@ def _drain_stderr(proc: subprocess.Popen) -> None:
             log.warning("[ffmpeg] %s", line)
 
 
+def _current_hour_path() -> Path:
+    """Path the segment muxer will open right now for the current clock hour."""
+    now = datetime.now()
+    return (ARCHIVE_DIR
+            / f"{now.year:04d}" / f"{now.month:02d}"
+            / now.strftime("%Y-%m-%d_%H-00.mp3"))
+
+
+def _rotate_in_progress_hour() -> None:
+    """
+    If the current hour's canonical file already exists and is non-empty, rename
+    it to a `.partN.mp3` sibling so the next ffmpeg invocation can open the
+    canonical name fresh. Called immediately before every ffmpeg invocation in
+    normal mode, so:
+
+    - On script restart mid-hour, the previous run's partial is preserved.
+    - On an ffmpeg crash/reconnect mid-hour, the just-closed file is preserved
+      so the new ffmpeg doesn't truncate it.
+
+    `N` is the smallest non-negative integer that produces a free filename, so
+    multiple restarts within the same hour stack as `.part0`, `.part1`, ...
+    """
+    path = _current_hour_path()
+    try:
+        if not path.exists() or path.stat().st_size == 0:
+            return
+    except OSError:
+        return
+    n = 0
+    while True:
+        candidate = path.with_name(f"{path.stem}.part{n}{path.suffix}")
+        if not candidate.exists():
+            break
+        n += 1
+    path.rename(candidate)
+    log.info("Preserved in-progress hour as %s (%.1f MB).",
+             candidate.name, candidate.stat().st_size / 1e6)
+
+
 def _ensure_month_dirs(months_ahead: int = 24) -> None:
     """
     Create archive/YYYY/MM/ for the current month and the next `months_ahead`
@@ -294,6 +333,8 @@ def run(test_mode: bool = False, transcribe: bool = False) -> None:
         watcher.start()
 
     while running:
+        if not test_mode:
+            _rotate_in_progress_hour()
         try:
             code = _run_ffmpeg(segment_seconds, test_out=test_out)
         except FileNotFoundError:

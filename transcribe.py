@@ -32,6 +32,7 @@ import json
 import logging
 import os
 import platform
+import re
 import signal
 import time
 from datetime import datetime, timezone
@@ -147,10 +148,25 @@ def provenance() -> dict:
     }
 
 
+# Matches a `.partN` suffix on the filename stem (N is one or more digits),
+# produced by archive.py when it rotates a mid-hour file on restart.
+_PART_SUFFIX_RE = re.compile(r"\.part\d+$")
+
+
+def _is_partial(mp3: Path) -> bool:
+    """A `.partN.mp3` file (archive.py's mid-hour rotation product) covers
+    only a slice of its parent hour; quality and downstream tooling should
+    treat it as a partial."""
+    return bool(_PART_SUFFIX_RE.search(mp3.stem))
+
+
 def _recording_datetime(mp3: Path) -> datetime | None:
-    """Parse the clock-aligned start time out of the segment filename."""
+    """Parse the clock-aligned start time out of the segment filename. Handles
+    canonical names like `2026-06-04_01-00` and the `.partN`-suffixed siblings
+    that archive.py produces on a mid-hour restart."""
+    stem = _PART_SUFFIX_RE.sub("", mp3.stem)
     try:
-        return datetime.strptime(mp3.stem, FILENAME_DT_FORMAT)
+        return datetime.strptime(stem, FILENAME_DT_FORMAT)
     except ValueError:
         return None
 
@@ -235,7 +251,8 @@ def transcribe_file(mp3: Path, force: bool = False) -> dict | None:
         "transcribe_seconds": round(elapsed, 1),
         "realtime_factor": round(audio_seconds / elapsed, 1) if elapsed else None,
         "segment_count": len(segments),
-        "quality": quality.analyze(mp3, bitrate_kbps=CONFIG["stream"]["bitrate_kbps"]),
+        "quality": quality.analyze(mp3, bitrate_kbps=CONFIG["stream"]["bitrate_kbps"],
+                                   partial=_is_partial(mp3)),
         "schedule_hint": _schedule_hint(mp3),
         "provenance": provenance(),
         "segments": segments,
@@ -340,7 +357,8 @@ def retag_all() -> None:
                 continue
             if not result.get("quality"):
                 log.info("Re-tag: backfilling quality for %s", jp.name)
-                result["quality"] = quality.analyze(mp3, bitrate_kbps=bitrate)
+                result["quality"] = quality.analyze(mp3, bitrate_kbps=bitrate,
+                                                    partial=_is_partial(mp3))
             result["schema_version"] = SCHEMA_VERSION
             _write_sidecars(mp3, result)
             updated += 1
