@@ -20,3 +20,6 @@ schedule/
 .claude/
 .vscode/
 .idea/
+
+# Personal deployment runbooks (machine-specific paths, hostnames, etc.)
+deploy-notes.md
