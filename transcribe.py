@@ -379,19 +379,19 @@ _watch_running = True
 
 def _completed_segments() -> list[Path]:
     """
-    All finished segments, excluding the in-progress hour. A file is 'finished'
-    if a newer segment exists (the recorder moved on) or — for the newest file
-    — if it isn't plausibly in-progress (we treat it as in-progress only when
-    BOTH its mtime is recent (< WATCH_STABLE_SECONDS) AND its size is below
-    the expected full-hour size). The combined check avoids the false-positive
-    where a paused recorder leaves a small recent file that one-shot `--all`
-    would otherwise sweep up as a partial, while still letting an old
-    short-segment from a long-stopped run through.
+    All finished segments, excluding any that look in-progress. A file is
+    treated as in-progress when BOTH its mtime is recent (< WATCH_STABLE_SECONDS)
+    AND its size is below 95% of an expected full-hour file. The combined check
+    is applied to every candidate, not just "the newest by path sort": with
+    `.partN.mp3` rotation files in the mix the path-sort heuristic can put
+    a stale-but-complete part *after* the actually-live canonical file, and
+    we don't want the live one to slip through as "completed". The size-floor
+    means a fully-recorded hour with recent mtime (just closed) is still
+    correctly included.
     """
     mp3s = sorted(p for p in ARCHIVE_DIR.rglob("*.mp3") if p.stat().st_size > 0)
     if not mp3s:
         return []
-    newest = mp3s[-1]
     now = time.time()
     # Expected full-hour size from the configured stream bitrate (kbps -> bytes
     # for an hour). 95% covers normal jitter between expected and actual.
@@ -399,12 +399,11 @@ def _completed_segments() -> list[Path]:
                         * CONFIG["stream"]["bitrate_kbps"] * 1000 / 8 * 0.95)
     out = []
     for f in mp3s:
-        if f == newest:
-            stat = f.stat()
-            recent = (now - stat.st_mtime) < WATCH_STABLE_SECONDS
-            small  = stat.st_size < expected_full
-            if recent and small:
-                continue  # still being written
+        stat = f.stat()
+        recent = (now - stat.st_mtime) < WATCH_STABLE_SECONDS
+        small  = stat.st_size < expected_full
+        if recent and small:
+            continue  # still being written
         out.append(f)
     return out
 
