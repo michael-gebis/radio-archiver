@@ -160,9 +160,11 @@ python transcribe.py --watch   # process 2: transcribe each hour as it completes
 ```
 
 `--watch` scans `archive/` periodically, transcribing any completed segment that
-lacks a transcript, and **leaves the in-progress hour alone** until it's done
-(detected by a newer file appearing, or the newest file going stale). Ctrl+C
-stops it cleanly after the current file.
+lacks a transcript, and **leaves the in-progress hour alone** until it's done.
+A file is treated as in-progress when its mtime is recent *and* its size is
+below the expected full-hour size; the check is applied to every candidate
+so `.partN` rotation siblings don't fool it. Ctrl+C stops it cleanly after
+the current file.
 
 ### Recording options
 
