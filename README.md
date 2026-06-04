@@ -168,11 +168,17 @@ stops it cleanly after the current file.
 
 ```bash
 python archive.py              # record forever, hourly segments (recording only)
-python archive.py --test       # record one 60-second segment, then exit
+python archive.py --test       # record one 60-second sample, then exit
 python archive.py --transcribe # single-process alternative: record AND transcribe
                                #   in one process (couples their lifecycles — prefer
                                #   the two-process setup above)
 ```
+
+In `--test` mode the output is a single fixed-duration capture (`ffmpeg -t 60`)
+that lands in `archive/test-YYYY-MM-DD_HH-MM-SS.mp3` at the top of the archive
+directory — so test files don't mix with the hourly `archive/YYYY/MM/` tree
+and successive runs don't overwrite each other. The startup log line "Output:"
+prints the exact path it'll use.
 
 Output lands in `archive/YYYY/MM/YYYY-MM-DD_HH-00.mp3` — files are grouped
 by year and month so a multi-year archive stays browsable. The `.txt` and

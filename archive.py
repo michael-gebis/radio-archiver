@@ -28,7 +28,7 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from types import FrameType
 
@@ -187,13 +187,21 @@ def _ensure_month_dirs(months_ahead: int = 24) -> None:
             year += 1
 
 
-def _build_cmd(segment_seconds: int) -> list[str]:
-    _ensure_month_dirs()
-    # Files land in archive/YYYY/MM/YYYY-MM-DD_HH-00.mp3 so a multi-year
-    # archive stays browsable. ffmpeg substitutes %Y/%m/%d/%H from the wall
-    # clock at the moment each new segment opens.
-    output_pattern = str(ARCHIVE_DIR / "%Y" / "%m" / "%Y-%m-%d_%H-00.mp3")
-    return [
+def _build_cmd(segment_seconds: int, test_out: Path | None = None) -> list[str]:
+    """
+    Build the ffmpeg command. Two modes:
+
+    - Normal: segment muxer, `-segment_atclocktime`, files land in
+      `archive/YYYY/MM/YYYY-MM-DD_HH-00.mp3`. ffmpeg keeps running, segmenting
+      forever until told to stop.
+    - Test (`test_out` set): a single fixed-duration capture (`-t`) with no
+      segment muxer, so ffmpeg exits cleanly after `segment_seconds`. Output
+      goes to the literal `test_out` path. The segment-muxer behavior is wrong
+      for test mode because (a) ffmpeg never self-exits and (b) within a single
+      hour the strftime filename doesn't change, so sub-hour segments overwrite
+      each other.
+    """
+    base = [
         FFMPEG,
         "-hide_banner",
         "-loglevel", "warning",
@@ -202,6 +210,13 @@ def _build_cmd(segment_seconds: int) -> list[str]:
         "-reconnect_delay_max", "30",
         "-i", STREAM_URL,
         "-c", "copy",
+    ]
+    if test_out is not None:
+        test_out.parent.mkdir(parents=True, exist_ok=True)
+        return base + ["-t", str(segment_seconds), str(test_out)]
+    _ensure_month_dirs()
+    output_pattern = str(ARCHIVE_DIR / "%Y" / "%m" / "%Y-%m-%d_%H-00.mp3")
+    return base + [
         "-f",                   "segment",
         "-segment_time",        str(segment_seconds),
         "-segment_atclocktime", "1",
@@ -211,9 +226,9 @@ def _build_cmd(segment_seconds: int) -> list[str]:
     ]
 
 
-def _run_ffmpeg(segment_seconds: int) -> int:
+def _run_ffmpeg(segment_seconds: int, test_out: Path | None = None) -> int:
     global _current_proc
-    cmd = _build_cmd(segment_seconds)
+    cmd = _build_cmd(segment_seconds, test_out=test_out)
     log.info("Starting ffmpeg:  %s", " ".join(cmd))
     # On Windows, launching ffmpeg in its own process group lets us send
     # CTRL_BREAK_EVENT for a graceful stop (see _handle_signal). On POSIX this
@@ -252,11 +267,21 @@ def run(test_mode: bool = False, transcribe: bool = False) -> None:
     global running
     segment_seconds = 60 if test_mode else SEGMENT_SECONDS
 
+    # In test mode, write to a single timestamped file at the top of
+    # ARCHIVE_DIR. The timestamp keeps successive --test runs from
+    # overwriting each other, and the top-level location keeps test files
+    # from mixing into the YYYY/MM/ hourly archive tree.
+    test_out: Path | None = None
+    if test_mode:
+        ARCHIVE_DIR.mkdir(exist_ok=True)
+        test_out = ARCHIVE_DIR / datetime.now().strftime("test-%Y-%m-%d_%H-%M-%S.mp3")
+
     log.info("%s archiver starting.", LABEL)
     log.info("Stream  : %s", STREAM_URL)
-    log.info("Output  : %s", ARCHIVE_DIR.resolve())
+    log.info("Output  : %s",
+             test_out.resolve() if test_out else ARCHIVE_DIR.resolve())
     log.info("Segments: %d s%s", segment_seconds,
-             "  [TEST MODE — will exit after one segment]" if test_mode else "")
+             "  [TEST MODE — single capture, ffmpeg exits at end]" if test_mode else "")
     if transcribe:
         log.info("Transcription: ENABLED inline (per-hour .txt/.json sidecars). "
                  "For a decoupled setup, run `transcribe.py --watch` instead.")
@@ -270,7 +295,7 @@ def run(test_mode: bool = False, transcribe: bool = False) -> None:
 
     while running:
         try:
-            code = _run_ffmpeg(segment_seconds)
+            code = _run_ffmpeg(segment_seconds, test_out=test_out)
         except FileNotFoundError:
             log.error(
                 "ffmpeg not found (tried: %s). Install ffmpeg and make sure it's on "
