@@ -206,14 +206,15 @@ def _rotate_in_progress_hour() -> None:
              candidate.name, candidate.stat().st_size / 1e6)
 
 
-def _ensure_month_dirs(months_ahead: int = 24) -> None:
+def _ensure_month_dirs(months_ahead: int = 1) -> None:
     """
     Create archive/YYYY/MM/ for the current month and the next `months_ahead`
     months. ffmpeg's segment muxer does not create intermediate directories,
     so we have to prepare them up-front — otherwise the first segment after a
-    month rollover would fail to open. 24 months of buffer means the recorder
-    can run uninterrupted for two years without manual help; each restart
-    (e.g. on a stream-drop reconnect) re-extends the buffer.
+    month rollover would fail to open. The default `months_ahead=1` keeps the
+    archive tree tidy (at most one empty future directory) and is refreshed
+    by `_month_dir_watchdog` on a periodic tick so an arbitrarily long
+    uninterrupted run still stays one month ahead of the wall clock.
     """
     ARCHIVE_DIR.mkdir(exist_ok=True)
     today = date.today()
@@ -224,6 +225,22 @@ def _ensure_month_dirs(months_ahead: int = 24) -> None:
         if month > 12:
             month = 1
             year += 1
+
+
+def _month_dir_watchdog(stop: threading.Event, interval_seconds: int = 3600) -> None:
+    """
+    Daemon-thread tick that keeps current + next month's archive dirs alive
+    over any uptime. Runs immediately, then again every `interval_seconds`
+    until `stop` is set. Hourly is well below the once-per-month frequency
+    actually needed — overhead is one or two mkdir-noops.
+    """
+    while True:
+        try:
+            _ensure_month_dirs(months_ahead=1)
+        except Exception as e:
+            log.warning("month-dir watchdog: %r (will retry next tick).", e)
+        if stop.wait(interval_seconds):
+            return
 
 
 def _build_cmd(segment_seconds: int, test_out: Path | None = None) -> list[str]:
@@ -332,6 +349,21 @@ def run(test_mode: bool = False, transcribe: bool = False) -> None:
         watcher = threading.Thread(target=_watcher, args=(stop_watcher,), daemon=True)
         watcher.start()
 
+    # Keep the YYYY/MM dirs alive over the lifetime of this process. Skipped
+    # in test mode (test mode writes to a single explicit path at archive
+    # root and never relies on the YYYY/MM tree).
+    stop_month_watchdog: threading.Event | None = None
+    month_watchdog: threading.Thread | None = None
+    if not test_mode:
+        stop_month_watchdog = threading.Event()
+        month_watchdog = threading.Thread(
+            target=_month_dir_watchdog,
+            args=(stop_month_watchdog,),
+            daemon=True,
+            name="month-dir-watchdog",
+        )
+        month_watchdog.start()
+
     while running:
         if not test_mode:
             _rotate_in_progress_hour()
@@ -361,6 +393,10 @@ def run(test_mode: bool = False, transcribe: bool = False) -> None:
         log.info("Archiver stopped. Waiting for inline transcription to finish...")
         stop_watcher.set()
         watcher.join(timeout=120)
+    if stop_month_watchdog is not None:
+        stop_month_watchdog.set()
+        if month_watchdog is not None:
+            month_watchdog.join(timeout=5)
     log.info("Done. Files saved to: %s", ARCHIVE_DIR.resolve())
 
 
