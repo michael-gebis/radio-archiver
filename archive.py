@@ -28,7 +28,7 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import FrameType
 
@@ -44,6 +44,15 @@ ARCHIVE_DIR     = Path(CONFIG["paths"]["archive_dir"])
 SEGMENT_SECONDS = 3600         # length of each output file (1 hour)
 RECONNECT_DELAY = 5            # seconds to wait after a drop before retrying
 LOG_FILE        = "archiver.log"
+# Touch this file to ask the recorder + watcher to exit cleanly at the next
+# safe moment (recorder: next hour boundary + 5s; watcher: end of current
+# file). systemd Restart=always brings them back up with fresh code on disk.
+# This file is gone (in tmpfs) after a reboot — no manual cleanup needed.
+RESTART_SENTINEL = Path("/tmp/RADIO_ARCH_RESTART_REQUIRED")
+# How long after the clock-hour boundary to signal ffmpeg, so the previous
+# hour is fully closed and the new hour has rolled to a fresh file.
+RESTART_BOUNDARY_BUFFER_SECONDS = 5
+RESTART_POLL_INTERVAL_SECONDS = 60
 # ---------------------------------------------------------------------------
 
 running: bool = True
@@ -74,21 +83,14 @@ import signal
 _current_proc: subprocess.Popen | None = None
 
 
-def _handle_signal(sig: int, frame: FrameType | None) -> None:
+def _ask_ffmpeg_to_exit() -> None:
     """
-    Ask ffmpeg to stop cleanly so the in-progress MP3 segment is closed with
-    a proper trailer.
-
-    On POSIX, `terminate()` sends SIGTERM and ffmpeg flushes on its own. On
-    Windows, SIGTERM maps to `TerminateProcess` which kills the child instantly
-    and truncates the segment — so we instead send CTRL_BREAK_EVENT to the
-    process group (ffmpeg was launched with CREATE_NEW_PROCESS_GROUP for this
-    reason). If ffmpeg ignores the break event we fall back to terminate so
-    shutdown isn't blocked forever.
+    Signal the running ffmpeg child to exit cleanly so the in-progress MP3
+    segment is closed with a proper trailer. POSIX SIGTERM works directly; on
+    Windows we send CTRL_BREAK_EVENT to the process group (ffmpeg was launched
+    with CREATE_NEW_PROCESS_GROUP for this), falling back to terminate() if
+    the break event is ignored. Safe to call when there is no live child.
     """
-    global running
-    log.info("Shutdown signal received — stopping after current ffmpeg exits.")
-    running = False
     proc = _current_proc
     if not (proc and proc.poll() is None):
         return
@@ -100,6 +102,17 @@ def _handle_signal(sig: int, frame: FrameType | None) -> None:
             proc.terminate()
     else:
         proc.terminate()
+
+
+def _handle_signal(sig: int, frame: FrameType | None) -> None:
+    """
+    Ask ffmpeg to stop cleanly so the in-progress MP3 segment is closed with
+    a proper trailer, then let the main loop exit.
+    """
+    global running
+    log.info("Shutdown signal received — stopping after current ffmpeg exits.")
+    running = False
+    _ask_ffmpeg_to_exit()
 
 
 signal.signal(signal.SIGINT, _handle_signal)
@@ -243,6 +256,62 @@ def _month_dir_watchdog(stop: threading.Event, interval_seconds: int = 3600) -> 
             return
 
 
+def _sentinel_mtime() -> float:
+    """mtime of the restart sentinel, or 0 if it doesn't exist."""
+    try:
+        return RESTART_SENTINEL.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _restart_watchdog(stop: threading.Event,
+                      poll_seconds: int = RESTART_POLL_INTERVAL_SECONDS) -> None:
+    """
+    Watch for `RESTART_SENTINEL` and, when found, schedule a graceful exit at
+    the next clock-hour boundary + RESTART_BOUNDARY_BUFFER_SECONDS so the
+    in-progress hour is fully captured. Then signal ffmpeg, set `running = False`,
+    and unlink the sentinel.
+
+    Method-A race-handling: the baseline mtime is fixed when the thread starts,
+    so a sentinel that already existed at startup is treated as "previous
+    incarnation already handled this" and does NOT trigger a fresh restart.
+    The watchdog reacts only to mtime values strictly greater than the
+    baseline — i.e. a `touch` after the service started. The transcriber does
+    NOT delete the sentinel; the recorder is intentionally the slow service so
+    that by the time it exits, the transcriber has already responded.
+    """
+    global running
+    baseline = _sentinel_mtime()
+    while not stop.wait(poll_seconds):
+        mt = _sentinel_mtime()
+        if mt <= baseline:
+            continue
+        # Sentinel touched after we started.
+        log.info("Restart sentinel detected (%s, mtime=%s); will exit at next "
+                 "hour boundary + %ds.",
+                 RESTART_SENTINEL, datetime.fromtimestamp(mt).isoformat(),
+                 RESTART_BOUNDARY_BUFFER_SECONDS)
+        now = datetime.now()
+        next_hour = (now + timedelta(hours=1)).replace(
+            minute=0, second=0, microsecond=0)
+        wait_until = next_hour + timedelta(seconds=RESTART_BOUNDARY_BUFFER_SECONDS)
+        wait_s = max(1.0, (wait_until - now).total_seconds())
+        log.info("Sleeping %.0fs until %s, then signaling ffmpeg.",
+                 wait_s, wait_until.isoformat(timespec="seconds"))
+        if stop.wait(wait_s):
+            return  # process shutting down for another reason
+        log.info("Restart time reached. Signaling ffmpeg and unlinking sentinel.")
+        running = False
+        _ask_ffmpeg_to_exit()
+        try:
+            RESTART_SENTINEL.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            log.warning("Could not unlink %s: %s", RESTART_SENTINEL, e)
+        return
+
+
 def _build_cmd(segment_seconds: int, test_out: Path | None = None) -> list[str]:
     """
     Build the ffmpeg command. Two modes:
@@ -354,6 +423,8 @@ def run(test_mode: bool = False, transcribe: bool = False) -> None:
     # root and never relies on the YYYY/MM tree).
     stop_month_watchdog: threading.Event | None = None
     month_watchdog: threading.Thread | None = None
+    stop_restart_watchdog: threading.Event | None = None
+    restart_watchdog: threading.Thread | None = None
     if not test_mode:
         stop_month_watchdog = threading.Event()
         month_watchdog = threading.Thread(
@@ -363,6 +434,15 @@ def run(test_mode: bool = False, transcribe: bool = False) -> None:
             name="month-dir-watchdog",
         )
         month_watchdog.start()
+        # Restart-on-sentinel watcher. See _restart_watchdog() for the design.
+        stop_restart_watchdog = threading.Event()
+        restart_watchdog = threading.Thread(
+            target=_restart_watchdog,
+            args=(stop_restart_watchdog,),
+            daemon=True,
+            name="restart-watchdog",
+        )
+        restart_watchdog.start()
 
     while running:
         if not test_mode:
@@ -397,6 +477,10 @@ def run(test_mode: bool = False, transcribe: bool = False) -> None:
         stop_month_watchdog.set()
         if month_watchdog is not None:
             month_watchdog.join(timeout=5)
+    if stop_restart_watchdog is not None:
+        stop_restart_watchdog.set()
+        if restart_watchdog is not None:
+            restart_watchdog.join(timeout=5)
     log.info("Done. Files saved to: %s", ARCHIVE_DIR.resolve())
 
 

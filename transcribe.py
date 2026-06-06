@@ -91,6 +91,14 @@ CONDITION_ON_PREVIOUS_TEXT = False
 WATCH_INTERVAL_SECONDS = 30
 WATCH_STABLE_SECONDS = 120
 
+# Touch this file to ask the --watch loop to exit cleanly after the current
+# file finishes. systemd Restart=always brings transcribe back with fresh code
+# on disk. Symmetric with archive.py's RESTART_SENTINEL — same path, same
+# mtime-baseline rule. The transcriber does NOT unlink it; the recorder owns
+# the delete (it's the slower service, so deletion after it exits guarantees
+# both have responded).
+RESTART_SENTINEL = Path("/tmp/RADIO_ARCH_RESTART_REQUIRED")
+
 log = logging.getLogger(__name__)
 
 _model: "WhisperModel | None" = None  # lazily-loaded singleton
@@ -431,11 +439,28 @@ def _handle_watch_signal(sig: int, frame: FrameType | None) -> None:
     _watch_running = False
 
 
+def _restart_sentinel_mtime() -> float:
+    """mtime of RESTART_SENTINEL, or 0 if missing/unreadable."""
+    try:
+        return RESTART_SENTINEL.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
 def watch(interval: int = WATCH_INTERVAL_SECONDS) -> None:
-    """Continuously transcribe completed segments as they appear. Ctrl+C to stop."""
+    """Continuously transcribe completed segments as they appear. Ctrl+C to stop.
+
+    Also reacts to `RESTART_SENTINEL`: a touch newer than the mtime observed
+    at watch() entry triggers a clean exit after the current file finishes, so
+    systemd brings the service back up with whatever code is now on disk. The
+    transcriber does NOT delete the sentinel — see RESTART_SENTINEL docstring.
+    """
+    global _watch_running
     signal.signal(signal.SIGINT, _handle_watch_signal)
     if hasattr(signal, "SIGTERM"):
         signal.signal(signal.SIGTERM, _handle_watch_signal)
+
+    baseline_restart_mtime = _restart_sentinel_mtime()
 
     log.info("Watching %s for completed segments every %ds. Ctrl+C to stop.",
              ARCHIVE_DIR.resolve(), interval)
@@ -447,9 +472,18 @@ def watch(interval: int = WATCH_INTERVAL_SECONDS) -> None:
                 transcribe_file(f)
         except Exception as e:
             log.error("Watch scan error (continuing): %s", e)
-        # Interruptible sleep so Ctrl+C is responsive between scans.
+        # Interruptible sleep so Ctrl+C is responsive between scans, and so
+        # the restart sentinel is noticed within ~1 s after being touched.
         for _ in range(interval):
             if not _watch_running:
+                break
+            mt = _restart_sentinel_mtime()
+            if mt > baseline_restart_mtime:
+                log.info("Restart sentinel detected (%s, mtime=%s); exiting "
+                         "after this scan finishes.",
+                         RESTART_SENTINEL,
+                         datetime.fromtimestamp(mt).isoformat())
+                _watch_running = False
                 break
             time.sleep(1)
     log.info("Watch stopped.")

@@ -243,6 +243,39 @@ has a `.json` sidecar, so they're **idempotent and resumable** — safe to run
 anytime (recorder running or not); rerun and they continue where they left off.
 Only `--force` re-transcribes existing files.
 
+### Requesting a self-restart (`/tmp/RADIO_ARCH_RESTART_REQUIRED`)
+
+When the services are under systemd with `Restart=always`, you can ask them
+to swap in newly-deployed code **without sudo** by touching a sentinel file:
+
+```bash
+touch /tmp/RADIO_ARCH_RESTART_REQUIRED
+```
+
+What happens:
+
+- **`transcribe.py --watch`** notices within ~1 second, finishes the current
+  file (or exits immediately if idle), and exits. systemd brings it back up
+  within a few seconds with whatever code is now on disk.
+- **`archive.py`** notices within ~60 seconds, schedules its exit for the
+  **next clock-hour boundary + 5 seconds** so the in-progress hour is fully
+  captured. ffmpeg gets the same graceful-shutdown signal as a manual
+  `systemctl stop`. On restart, the brief next-hour file (5 seconds of
+  audio) is rotated to `.part0.mp3` and the new ffmpeg writes the canonical
+  filename fresh — exactly the existing `.partN` recovery flow.
+
+Worst-case wait for the recorder is just under one hour (touch at HH:00:01).
+Best case is seconds (touch at HH:59:59). If you need an immediate restart,
+`sudo systemctl restart radio-archive` still works.
+
+**Mtime-based detection** means the sentinel left over on disk between
+touches doesn't keep re-triggering: each service baselines the file's mtime
+at startup and reacts only to a strictly newer mtime, so a touch only
+triggers one restart cycle. The **recorder is responsible for unlinking the
+sentinel** when it finally exits — by then the (much faster) transcriber has
+already responded, so there's no race where the sentinel disappears before
+the recorder sees it.
+
 ### Tuning via environment variables
 
 | Variable | Default | Effect |
