@@ -17,9 +17,10 @@ an Icecast-style MP3 stream should work.
 | `config.py` | Loads `config.json` (station-specific settings). |
 | `archive.py` | Records the stream into hourly `.mp3` files. Recording only. |
 | `transcribe.py` | Per-hour processing: transcript + quality checks + schedule hint, written to one `.txt` + `.json` sidecar. |
-| `quality.py` | Shared audio quality checks (size / silence / decode errors) + ffmpeg/ffprobe location. |
+| `quality.py` | Shared audio quality checks (size / silence / volume / decode errors) + ffmpeg/ffprobe location + `is_off_air` helper. |
 | `schedule_archive.py` | Archives the published show schedule daily and parses it into structured snapshots. |
 | `merge_archives.py` | Reconciles two parallel-recorder archives into one canonical tree (winner-takes-all per hour, plus cross-fill splicing for partially-bad hours). |
+| `purge_silent.py` | Tombstone-style cleanup: deletes the `.mp3` for sidecars marked `is_off_air`, keeps `.json` and `.txt`. Default dry-run. |
 
 ---
 
@@ -294,14 +295,18 @@ full **provenance** block so a future reader can decide whether re-transcribing
   "segment_count": 87,
   "quality": {
     "expected_seconds": 3600,
+    "partial": false,
     "size": { "actual_mb": 86.4, "expected_mb": 86.4, "ratio": 1.0, "ok": true },
     "silence_periods": [
       { "start": 0.0, "end": 219.7, "duration": 219.7 }
     ],
+    "max_volume_db": 0.0,
+    "mean_volume_db": -10.7,
     "decode_errors": null,
     "decode_exit_code": 0,
     "tool_error": null,
-    "thresholds": { "size_ratio_warn": 0.8, "silence_threshold": "-40dB", "silence_min_secs": 10, "stream_bitrate_kbps": 192 },
+    "thresholds": { "size_ratio_warn": 0.8, "silence_threshold": "-40dB", "silence_min_secs": 10, "stream_bitrate_kbps": 192, "off_air_peak_db": -30, "off_air_min_audio_s": 3300 },
+    "is_off_air": false,
     "ok": false
   },
   "schedule_hint": {
@@ -349,12 +354,22 @@ Field notes for future evaluation:
   (1 = transcript + provenance; 2 = added `schedule_hint`; 3 = added `quality`).
 - `quality` = the per-hour audio checks (computed by `quality.py`): `size`
   (actual vs expected bytes — catches stream outages), `silence_periods` (dead
-  air ≥ threshold), and `decode_errors` (full ffmpeg null-muxer decode pass —
-  every frame is decoded so mid-stream corruption is caught, not only
-  unopenable containers; `decode_exit_code` records ffmpeg's return code).
-  `ok` is true only if all pass; `tool_error` is set instead if ffmpeg/ffprobe
-  was unavailable. `thresholds` records the limits used, so a future reader
-  knows how it was judged.
+  air ≥ threshold), `max_volume_db` / `mean_volume_db` (peak / mean amplitude
+  in dBFS, from `volumedetect`), and `decode_errors` (full ffmpeg null-muxer
+  decode pass — every frame is decoded so mid-stream corruption is caught,
+  not only unopenable containers; `decode_exit_code` records ffmpeg's return
+  code). `ok` is true only if all pass; `tool_error` is set instead if
+  ffmpeg/ffprobe was unavailable. `thresholds` records the limits used, so a
+  future reader knows how it was judged.
+- `is_off_air` = true only when the file is positively identified as
+  broadcast-side carrier noise: `max_volume_db` below the
+  `off_air_peak_db` threshold (−30 dB by default, so inaudible to a
+  listener), `speech_seconds == 0` (Silero VAD found nothing), audio
+  duration ≥ `off_air_min_audio_s` (a near-full hour, not a `.partN`
+  partial), and no `tool_error`. The intent is **strict**: an
+  instrumental music hour with peaks at 0 dB is *not* off-air; even one
+  VAD frame keeps the file. See [§12](#12-off-air-detection-and-purging)
+  for the purge workflow.
 - `schedule_hint` = a **non-authoritative** guess at the show for that hour, from
   the archived schedule (see [§9](#9-show-schedule-archiving)). Names are chosen
   to avoid implying authority: `listed_shows` = "what the published grid listed",
@@ -836,6 +851,75 @@ candidate — so the merge is auditable after the fact.
 
 Schedule dirs (`--schedule-*`) merge in parallel with simpler rules: prefer
 `parse_ok`, then higher `event_count` per date.
+
+---
+
+## 12. Off-air detection and purging
+
+Some stations don't broadcast 24/7 — overnight blocks may be carrier hiss,
+station-tone loops, or true silence rather than programming. The recorder
+captures these hours indistinguishably at full bitrate (~86 MB/hour at 192
+kbps), so an unattended deployment can accumulate a lot of disk usage on
+non-content.
+
+`quality.py` measures peak / mean amplitude in dBFS via `volumedetect` in
+the same ffmpeg pass as `silencedetect`. Combined with the existing Silero
+VAD speech count, an hour is positively identified as **off-air** when ALL
+of these hold:
+
+- `max_volume_db < OFF_AIR_PEAK_DB` (default `-30 dBFS` — well below any
+  music programming, which routinely peaks at `0 dBFS`)
+- `speech_seconds == 0` (Silero VAD detected no speech)
+- `audio_seconds >= OFF_AIR_MIN_AUDIO_S` (default `3300 s` — a near-full
+  hour; partial `.partN` files are explicitly excluded by their `partial`
+  flag too)
+- `tool_error` is `None` (the measurement itself is trustworthy)
+
+The criteria are deliberately strict — instrumental music with peaks at
+0 dB stays even when there's no speech, and a single VAD frame is enough
+to keep a file regardless of volume. The intended false-positive rate is
+zero. `quality.is_off_air()` is the single source of truth; the
+boolean lands in each sidecar as `quality.is_off_air`.
+
+The `.txt` header shows `quality: OFF-AIR (peak X dB)` for these files,
+and the body line below the header says `(no speech detected — off-air
+signal, no broadcast content)` instead of the music-only-hour wording.
+
+### Purging the MP3s
+
+```bash
+python purge_silent.py            # dry-run, walks the whole archive
+python purge_silent.py --apply    # actually deletes
+python purge_silent.py FILE.json [...]   # check specific sidecars
+```
+
+`purge_silent.py` deletes only the `.mp3` for sidecars where
+`quality.is_off_air == true`. The `.json` and `.txt` sidecars are
+**kept** as tombstones — they remain searchable, document what was
+recorded (peak / mean volume, silence breakdown, schedule_hint), and
+prevent the transcriber from re-processing the missing `.mp3` on the
+next `--watch` poll. After deletion:
+
+- The sidecar gets a new `quality.mp3_deleted_utc` field (ISO date).
+- A `# off-air detected; mp3 deleted YYYY-MM-DD UTC` line is appended to
+  the `.txt`.
+
+The purge is safe to run repeatedly — already-tombstoned hours are
+skipped (no `.mp3` to delete). Run it from cron / a systemd timer after
+your B2 rotation if you want off-air hours never to even reach cloud
+storage.
+
+### Re-tagging existing sidecars
+
+Older sidecars produced before this feature don't have `max_volume_db`
+or `is_off_air`. Backfill them with:
+```bash
+python transcribe.py --retag
+```
+`--retag` recomputes the quality block for any sidecar missing the new
+volume fields, then re-evaluates `is_off_air`. Idempotent — running it
+again on already-up-to-date sidecars is a no-op except for the schedule
+hint refresh.
 
 ---
 

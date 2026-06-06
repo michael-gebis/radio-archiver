@@ -14,8 +14,22 @@ Shared by:
 Checks:
   - size     : actual vs expected file size (catches stream outages)
   - silence  : ffmpeg silencedetect (flags dead air >= SILENCE_MIN_SECS)
+  - volume   : ffmpeg volumedetect — peak / mean amplitude in dBFS. Used by
+               the off-air detector: an entire hour with peak << 0 dB and no
+               VAD speech is broadcast-side carrier noise, not content.
   - errors   : full ffmpeg decode pass via null muxer (catches mid-stream
                frame errors, not just unopenable containers)
+
+`is_off_air()` is the helper transcribers call after both `analyze()` and the
+VAD/Whisper pass have produced their numbers. It returns True only when ALL of
+the following hold for the file:
+  - `max_volume_db < OFF_AIR_PEAK_DB` (peak amplitude inaudible)
+  - `speech_seconds == 0` (Silero VAD detected no speech)
+  - `audio_seconds >= OFF_AIR_MIN_AUDIO_S` (full-hour file, not a partial)
+  - `tool_error is None` (we trust the measurements)
+The combination is intentionally narrow — instrumental music hits 0 dB peaks
+even when the mean is low, so it's NOT marked off-air. A single VAD frame is
+enough to keep a file.
 """
 
 import os
@@ -85,6 +99,18 @@ SIZE_RATIO_WARN          = 0.80     # flag if a segment is < this fraction of ex
 SILENCE_THRESHOLD        = "-40dB"  # audio level considered silence
 SILENCE_MIN_SECS         = 10       # minimum silence duration to flag (seconds)
 
+# Off-air detection (see is_off_air()). -30 dBFS as the peak threshold sits
+# well below typical music programming (which routinely peaks at 0 dBFS) but
+# comfortably above broadcast-side carrier hiss / encoder noise (which on
+# UCLA Radio measured at ~-36 dBFS peak across full-hour off-air files).
+#
+# The audio-seconds floor is set against the *measured* normal full-hour
+# duration on this stream (~3430-3462 s — not 3600). 3300 is comfortably
+# below that floor and comfortably above the largest .partN partial seen
+# in production (~2880 s).
+OFF_AIR_PEAK_DB     = -30.0
+OFF_AIR_MIN_AUDIO_S = 3300
+
 
 def fmt_hms(secs: float) -> str:
     """Format a number of seconds as `H:MM:SS` (no leading zero on hours)."""
@@ -104,14 +130,21 @@ def _check_size(path: Path, expected_seconds: int, bitrate_kbps: int) -> dict:
     }
 
 
-def _check_silence(path: Path) -> tuple[list[dict], str | None]:
-    """ffmpeg silencedetect -> (periods, tool_error). Each period is
-    {start, end, duration}; end/duration are None if the file ended while still
-    silent. `tool_error` is set if ffmpeg exited non-zero and no periods were
-    parsed (genuine failure, not just a noisy clean run)."""
+def _silence_and_volume(path: Path) -> tuple[list[dict], float | None, float | None, str | None]:
+    """
+    Combined ffmpeg pass: silencedetect + volumedetect, parsed out of one
+    stderr stream. Returns (silence_periods, max_volume_db, mean_volume_db,
+    tool_error).
+
+    Each silence period is {start, end, duration}; end/duration are None if
+    the file ended while still silent. Volume values come from volumedetect's
+    summary lines (printed once at end-of-input). `tool_error` is set if
+    ffmpeg exited non-zero and no periods were parsed — i.e. a genuine
+    failure rather than a clean noisy run.
+    """
     cmd = [
         FFMPEG, "-hide_banner", "-nostdin", "-i", str(path),
-        "-af", f"silencedetect=noise={SILENCE_THRESHOLD}:duration={SILENCE_MIN_SECS}",
+        "-af", f"silencedetect=noise={SILENCE_THRESHOLD}:duration={SILENCE_MIN_SECS},volumedetect",
         "-f", "null", "-",
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True)
@@ -126,11 +159,15 @@ def _check_silence(path: Path) -> tuple[list[dict], str | None]:
             "end": round(end, 1) if end is not None else None,
             "duration": round(end - start, 1) if end is not None else None,
         })
+    mean_m = re.search(r"mean_volume:\s*(-?[\d.]+)\s*dB", out)
+    max_m  = re.search(r"max_volume:\s*(-?[\d.]+)\s*dB", out)
+    mean_db = round(float(mean_m.group(1)), 1) if mean_m else None
+    max_db  = round(float(max_m.group(1)), 1)  if max_m  else None
     err = None
-    if proc.returncode != 0 and not periods:
+    if proc.returncode != 0 and not periods and mean_db is None and max_db is None:
         tail = (out or "").strip().splitlines()[-3:]
-        err = f"ffmpeg silencedetect exit {proc.returncode}: {' | '.join(tail)[:300]}"
-    return periods, err
+        err = f"ffmpeg silence+volume exit {proc.returncode}: {' | '.join(tail)[:300]}"
+    return periods, max_db, mean_db, err
 
 
 def _decode_scan(path: Path) -> tuple[str | None, int]:
@@ -169,6 +206,8 @@ def analyze(path: str | Path, expected_seconds: int = EXPECTED_SEGMENT_SECONDS,
         "partial": partial,
         "size": _check_size(path, expected_seconds, bitrate_kbps),
         "silence_periods": [],
+        "max_volume_db": None,
+        "mean_volume_db": None,
         "decode_errors": None,
         "decode_exit_code": None,
         "tool_error": None,
@@ -177,6 +216,8 @@ def analyze(path: str | Path, expected_seconds: int = EXPECTED_SEGMENT_SECONDS,
             "size_ratio_warn": SIZE_RATIO_WARN,
             "silence_threshold": SILENCE_THRESHOLD,
             "silence_min_secs": SILENCE_MIN_SECS,
+            "off_air_peak_db": OFF_AIR_PEAK_DB,
+            "off_air_min_audio_s": OFF_AIR_MIN_AUDIO_S,
         },
     }
     if partial:
@@ -184,8 +225,10 @@ def analyze(path: str | Path, expected_seconds: int = EXPECTED_SEGMENT_SECONDS,
         # subset of an hour. Keep the measured values, drop the pass/fail.
         result["size"]["ok"] = None
     try:
-        periods, sil_err = _check_silence(path)
+        periods, max_db, mean_db, sil_err = _silence_and_volume(path)
         result["silence_periods"] = periods
+        result["max_volume_db"] = max_db
+        result["mean_volume_db"] = mean_db
         decode_err, decode_rc = _decode_scan(path)
         result["decode_errors"] = decode_err
         result["decode_exit_code"] = decode_rc
@@ -205,12 +248,42 @@ def analyze(path: str | Path, expected_seconds: int = EXPECTED_SEGMENT_SECONDS,
     return result
 
 
+def is_off_air(quality: dict, speech_seconds: float, audio_seconds: float) -> bool:
+    """
+    Decide whether a file is off-air: near-full-hour duration, not flagged
+    as a `.partN` partial, no VAD speech, peak amplitude inaudible, and the
+    quality measurement itself trusted.
+
+    Each criterion is intentionally strict (any single failure → False), so
+    instrumental music (peak 0 dB), a single VAD frame, partial files, and
+    files where ffmpeg failed all stay safely non-off-air.
+    """
+    if not quality:
+        return False
+    if quality.get("tool_error"):
+        return False
+    if quality.get("partial"):
+        return False
+    max_db = quality.get("max_volume_db")
+    if max_db is None:
+        return False
+    return (
+        max_db < OFF_AIR_PEAK_DB
+        and speech_seconds == 0
+        and audio_seconds >= OFF_AIR_MIN_AUDIO_S
+    )
+
+
 def summarize(quality: dict | None) -> str:
     """One-line human-readable summary for logs / .txt headers."""
     if not quality:
         return "n/a"
     if quality.get("tool_error"):
         return f"unavailable ({quality['tool_error']})"
+    if quality.get("is_off_air"):
+        peak = quality.get("max_volume_db")
+        peak_str = f"{peak} dB" if peak is not None else "?"
+        return f"OFF-AIR (peak {peak_str})"
     parts = []
     if quality.get("partial"):
         size = quality.get("size", {})

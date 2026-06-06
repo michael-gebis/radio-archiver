@@ -257,6 +257,8 @@ def transcribe_file(mp3: Path, force: bool = False) -> dict | None:
         "provenance": provenance(),
         "segments": segments,
     }
+    result["quality"]["is_off_air"] = quality.is_off_air(
+        result["quality"], speech_seconds, audio_seconds)
 
     _write_sidecars(mp3, result)
     log.info(
@@ -302,6 +304,8 @@ def _write_sidecars(mp3: Path, result: dict) -> None:
     if result["segments"]:
         for seg in result["segments"]:
             lines.append(f"[{quality.fmt_hms(seg['start'])} -> {quality.fmt_hms(seg['end'])}]  {seg['text']}")
+    elif (result.get("quality") or {}).get("is_off_air"):
+        lines.append("(no speech detected — off-air signal, no broadcast content)")
     else:
         lines.append("(no speech detected — likely a music-only hour)")
     lines.append("")
@@ -355,10 +359,18 @@ def retag_all() -> None:
                 _write_sidecars(mp3, result)
                 updated += 1
                 continue
-            if not result.get("quality"):
-                log.info("Re-tag: backfilling quality for %s", jp.name)
+            q = result.get("quality") or {}
+            if not q or "max_volume_db" not in q:
+                # Backfill quality (or re-run it to populate the new
+                # max_volume_db / mean_volume_db fields needed by is_off_air).
+                log.info("Re-tag: (re)computing quality for %s", jp.name)
                 result["quality"] = quality.analyze(mp3, bitrate_kbps=bitrate,
                                                     partial=_is_partial(mp3))
+            result["quality"]["is_off_air"] = quality.is_off_air(
+                result["quality"],
+                result.get("speech_seconds") or 0.0,
+                result.get("audio_seconds") or 0.0,
+            )
             result["schema_version"] = SCHEMA_VERSION
             _write_sidecars(mp3, result)
             updated += 1
