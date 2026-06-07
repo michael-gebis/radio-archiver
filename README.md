@@ -21,6 +21,7 @@ an Icecast-style MP3 stream should work.
 | `schedule_archive.py` | Archives the published show schedule daily and parses it into structured snapshots. |
 | `merge_archives.py` | Reconciles two parallel-recorder archives into one canonical tree (winner-takes-all per hour, plus cross-fill splicing for partially-bad hours). |
 | `purge_silent.py` | Tombstone-style cleanup: deletes the `.mp3` for sidecars marked `is_off_air`, keeps `.json` and `.txt`. Default dry-run. |
+| `music_id.py` | Best-effort song identification for music-suspected regions via Chromaprint + AcoustID. Writes a `music_hint` block into each sidecar. Default dry-run. |
 
 ---
 
@@ -953,6 +954,106 @@ python transcribe.py --retag
 volume fields, then re-evaluates `is_off_air`. Idempotent — running it
 again on already-up-to-date sidecars is a no-op except for the schedule
 hint refresh.
+
+---
+
+## 13. Music identification (best-effort)
+
+The transcriber gates Whisper behind Silero VAD, so music regions are
+deliberately skipped during transcription (it would just hallucinate
+lyric-ish gibberish over instrumentals). That leaves a known gap: the
+station plays a *lot* of music we don't say anything about in the
+sidecars.
+
+`music_id.py` is a separate post-pass that fills that gap **best-effort**.
+For each hour:
+
+1. Compute "music-suspected" regions = complement of `segments[]`
+   (Whisper speech) and `quality.silence_periods[]`. Anything else is
+   presumed music.
+2. For each music region ≥ 30 s, extract a chunk via ffmpeg, compute a
+   Chromaprint perceptual fingerprint via `fpcalc`, and look it up in
+   the free [AcoustID](https://acoustid.org/) database.
+3. Write a `music_hint` block into the sidecar — same naming convention
+   as `schedule_hint` (best-effort, gracefully nullable, prose `note`
+   field carrying the caveat).
+
+### Setup
+
+```bash
+sudo apt install libchromaprint-tools         # provides `fpcalc`
+pip install pyacoustid                        # in the venv
+# Sign up at https://acoustid.org/ for a free API key, then:
+export ACOUSTID_API_KEY='your-key-here'
+```
+
+### Usage
+
+```bash
+python music_id.py FILE.json                  # dry-run on a single sidecar
+python music_id.py FILE.json --apply          # actually look up + write
+python music_id.py --all                      # dry-run across the archive
+python music_id.py --all --apply              # backfill everything
+python music_id.py FILE.json --apply --force  # re-run on an already-ID'd hour
+```
+
+Default mode is **dry-run**: it computes the music regions and lists
+them but does not call AcoustID or modify any sidecar. Pass `--apply`
+to actually do the work.
+
+### Sidecar schema
+
+```json
+"music_hint": {
+  "source": "acoustid",
+  "note": "Best-effort song identification via Chromaprint/AcoustID; coverage of indie/college-radio music is uneven.",
+  "fpcalc_version": "fpcalc version 1.5.1",
+  "pyacoustid_version": "1.3.0",
+  "looked_up_utc": "2026-06-07T20:30:00+00:00",
+  "threshold": 0.85,
+  "segments": [
+    {
+      "start": 234.5,
+      "end": 437.1,
+      "duration": 202.6,
+      "lookups": [
+        { "provider": "acoustid", "status": "ok", "score": 0.92 }
+      ],
+      "match": {
+        "source": "acoustid",
+        "score": 0.92,
+        "title": "Some Song Title",
+        "artists": ["Some Artist"],
+        "release": "Album Name",
+        "recording_id": "<musicbrainz UUID>"
+      }
+    },
+    {
+      "start": 437.1,
+      "end": 612.0,
+      "duration": 174.9,
+      "lookups": [
+        { "provider": "acoustid", "status": "no_match" }
+      ],
+      "match": null
+    }
+  ]
+}
+```
+
+The `lookups[]` array is the audit trail of what was attempted; `match`
+is the chosen result (or `null` if nothing met the score threshold). The
+schema is forward-compatible with adding a paid provider as a cascade —
+when added, each segment's `lookups[]` array gains a second entry, no
+existing fields change.
+
+### Coverage expectations
+
+AcoustID is crowdsourced — coverage is good for mainstream music, much
+weaker for indie and college-radio fare. Realistic hit rate for a
+college station is in the **30–50%** range. Non-matches are still useful
+data: the sidecar records that the hour had N distinct music segments
+totalling X minutes, even if only some were identified by title/artist.
 
 ---
 
